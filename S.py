@@ -43,7 +43,7 @@ QUEUE_MAX           = CONCURRENCY * 4
 TIMEOUT             = 10
 MAX_GENERATE        = 20000
 MAX_PROXY_FAILS     = 3
-MAX_TOKEN_FAILS     = 2
+MAX_TOKEN_FAILS     = 4
 MAX_FORBIDDEN       = 4
 MAX_RETRIES         = 4
 PROXY_COOLDOWN      = 60
@@ -64,13 +64,15 @@ STATE_FILE   = 'state.json'
 BENCH_FILE   = 'benchmark.json'
 
 TERMINAL_STATUSES  = {'available', 'taken', 'invalid_format'}
-RETRYABLE_STATUSES = {'error', 'timeout', 'rate_limited', 'forbidden',
-                      'not_found', 'proxy_dead', 'token_dead',
-                      'tls_error', 'dns_error', 'conn_refused',
-                      'conn_reset', 'internal_error', 'unknown_response'}
 
+TOKEN_FAULT = {'token_dead'}
 
-# ======================== RUNTIME ========================
+PROXY_FAULT = {'proxy_dead', 'dns_error', 'conn_refused',
+               'conn_reset', 'tls_error'}
+
+NEUTRAL = {'timeout', 'forbidden', 'not_found', 'unknown_response',
+           'internal_error', 'error', 'invalid_format', 'rate_limited'}
+
 
 def rss_mb():
     try:
@@ -152,8 +154,9 @@ class Metrics:
 
             if stage:
                 for k, v in stage.items():
-                    self.stage_sums[k] += v
-                    self.stage_count[k] += 1
+                    if isinstance(v, (int, float)):
+                        self.stage_sums[k] += v
+                        self.stage_count[k] += 1
 
     @staticmethod
     def _percentile(sorted_vals, p):
@@ -209,6 +212,7 @@ class Pool:
         self.items = [self._make(v) for v in values]
         self.idx = -1
         self.fail_limit = MAX_PROXY_FAILS if name == 'proxy' else MAX_TOKEN_FAILS
+        self.lease_timeout = TIMEOUT + 5
 
     @staticmethod
     def _make(value):
@@ -216,41 +220,65 @@ class Pool:
             'value': value, 'status': 'alive',
             'fails': 0, 'forbidden': 0, 'ok': 0,
             'cooldown_until': 0.0, 'reason': None,
+            'busy_until': 0.0,
+            'in_use': 0,
         }
 
     def size(self):
         with self.lock:
             return len(self.items)
 
-    def _refresh_locked(self):
-        now = time.time()
-        for it in self.items:
-            if it['status'] == 'cooldown' and it['cooldown_until'] <= now:
-                it['status'] = 'alive'
-                it['fails'] = 0
+    def _is_free_locked(self, it, now):
+        if it['status'] == 'cooldown' and it['cooldown_until'] <= now:
+            it['status'] = 'alive'
+            it['fails'] = 0
+        if it['status'] != 'alive':
+            return False
+        if it['busy_until'] > now:
+            return False
+        return True
 
     def next(self):
         with self.lock:
             if not self.items:
                 return None
-            self._refresh_locked()
+            now = time.time()
             n = len(self.items)
             for _ in range(n):
                 self.idx = (self.idx + 1) % n
                 it = self.items[self.idx]
-                if it['status'] == 'alive':
+                if self._is_free_locked(it, now):
+                    it['busy_until'] = now + self.lease_timeout
+                    it['in_use'] += 1
                     return it
             return None
 
+    def release(self, item):
+        if item is None:
+            return
+        with self.lock:
+            item['busy_until'] = 0.0
+            if item['in_use'] > 0:
+                item['in_use'] -= 1
+
     def has_cooldown(self):
         with self.lock:
-            return any(it['status'] == 'cooldown' for it in self.items)
+            now = time.time()
+            return any(it['status'] == 'cooldown' and it['cooldown_until'] > now
+                       for it in self.items)
 
     def next_cooldown_delta(self):
         with self.lock:
             now = time.time()
             deltas = [it['cooldown_until'] - now for it in self.items
-                      if it['status'] == 'cooldown']
+                      if it['status'] == 'cooldown' and it['cooldown_until'] > now]
+            return max(0.1, min(deltas)) if deltas else None
+
+    def next_free_delta(self):
+        with self.lock:
+            now = time.time()
+            deltas = [it['busy_until'] - now for it in self.items
+                      if it['status'] == 'alive' and it['busy_until'] > now]
             return max(0.1, min(deltas)) if deltas else None
 
     def report(self, item, status, cooldown=0.0):
@@ -283,10 +311,13 @@ class Pool:
 
     def stats(self):
         with self.lock:
+            now = time.time()
             a = sum(1 for i in self.items if i['status'] == 'alive')
             d = sum(1 for i in self.items if i['status'] == 'dead')
             c = sum(1 for i in self.items if i['status'] == 'cooldown')
-            return {'total': len(self.items), 'alive': a, 'dead': d, 'cooldown': c}
+            busy = sum(1 for i in self.items if i['busy_until'] > now)
+            return {'total': len(self.items), 'alive': a,
+                    'dead': d, 'cooldown': c, 'busy': busy}
 
     def dead_list(self):
         with self.lock:
@@ -358,6 +389,7 @@ class JSONLWriter:
         if self.closed:
             return
         line = json.dumps(rec, ensure_ascii=False)
+        need = False
         with self.lock:
             self.buf.append(line)
             need = (len(self.buf) >= self.batch or
@@ -610,7 +642,14 @@ def acquire(pool, max_wait):
         if it is not None:
             return it
         if not pool.has_cooldown():
-            return None
+            free_delta = pool.next_free_delta()
+            if free_delta is None:
+                return None
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            time.sleep(min(free_delta, 1.0, remaining))
+            continue
         delta = pool.next_cooldown_delta()
         if delta is None:
             return None
@@ -665,24 +704,28 @@ def check_with_retry(username, token_pool, proxy_pool, limiter, t_enqueue):
     if not is_valid_username(username):
         ts['done'] = time.perf_counter()
         return make_record(username, 'invalid_format', 0, 0.0,
-                           'precheck_local', None, None, 0, compute_timing(ts))
+                           'precheck_local', None, None, 0,
+                           compute_timing(ts))
 
     use_proxy = proxy_pool.size() > 0
     used_tokens = set()
     used_proxies = set()
     last = None
     attempts_made = 0
+    last_reason = 'no_attempt'
 
     for _ in range(MAX_RETRIES):
         limiter.wait_if_paused()
 
         token_item = acquire(token_pool, ACQUIRE_MAX_WAIT)
         ts['token_ok'] = time.perf_counter()
-        if token_item is None or token_item['value'] in used_tokens:
-            ts['done'] = time.perf_counter()
-            last = make_record(username, 'error', 0, 0.0,
-                               'no_token_available', None, None,
-                               attempts_made, compute_timing(ts))
+
+        if token_item is None:
+            last_reason = 'no_token_available'
+            break
+        if token_item['value'] in used_tokens:
+            token_pool.release(token_item)
+            last_reason = 'tokens_exhausted'
             break
         used_tokens.add(token_item['value'])
 
@@ -690,12 +733,14 @@ def check_with_retry(username, token_pool, proxy_pool, limiter, t_enqueue):
         if use_proxy:
             proxy_item = acquire(proxy_pool, ACQUIRE_MAX_WAIT)
             ts['proxy_ok'] = time.perf_counter()
-            if proxy_item is None or proxy_item['value'] in used_proxies:
-                ts['done'] = time.perf_counter()
-                last = make_record(username, 'error', 0, 0.0,
-                                   'no_proxy_available', None,
-                                   token_id(token_item['value']),
-                                   attempts_made, compute_timing(ts))
+            if proxy_item is None:
+                token_pool.release(token_item)
+                last_reason = 'no_proxy_available'
+                break
+            if proxy_item['value'] in used_proxies:
+                token_pool.release(token_item)
+                proxy_pool.release(proxy_item)
+                last_reason = 'proxies_exhausted'
                 break
             used_proxies.add(proxy_item['value'])
         else:
@@ -704,9 +749,26 @@ def check_with_retry(username, token_pool, proxy_pool, limiter, t_enqueue):
         proxy_val = proxy_item['value'] if proxy_item else None
         attempts_made += 1
 
-        status, ra, http_code, reason, timing = check_username(
-            username, token_item['value'], proxy_val, limiter, ts
-        )
+        try:
+            status, ra, http_code, reason, timing = check_username(
+                username, token_item['value'], proxy_val, limiter, ts
+            )
+        except Exception as e:
+            token_pool.release(token_item)
+            if proxy_item:
+                proxy_pool.release(proxy_item)
+            ts['done'] = time.perf_counter()
+            return make_record(
+                username, 'internal_error', 0, 0.0,
+                f'check_exception:{type(e).__name__}:{str(e)[:60]}',
+                proxy_val, token_id(token_item['value']),
+                attempts_made, compute_timing(ts)
+            )
+        finally:
+            token_pool.release(token_item)
+            if proxy_item:
+                proxy_pool.release(proxy_item)
+
         lat_ms = (timing['http_end'] - timing['http_start']) * 1000
 
         if status in TERMINAL_STATUSES:
@@ -714,61 +776,53 @@ def check_with_retry(username, token_pool, proxy_pool, limiter, t_enqueue):
             if proxy_item:
                 proxy_pool.report(proxy_item, status)
             ts['done'] = time.perf_counter()
-            return make_record(username, status, http_code, round(lat_ms, 1),
-                               reason, proxy_val, token_id(token_item['value']),
-                               attempts_made, compute_timing(ts))
+            return make_record(
+                username, status, http_code, round(lat_ms, 1),
+                reason, proxy_val, token_id(token_item['value']),
+                attempts_made, compute_timing(ts)
+            )
 
         if status == 'unknown_response':
-            token_pool.report(token_item, 'error')
-            if proxy_item:
-                proxy_pool.report(proxy_item, 'error')
             ts['done'] = time.perf_counter()
-            return make_record(username, status, http_code, round(lat_ms, 1),
-                               reason, proxy_val, token_id(token_item['value']),
-                               attempts_made, compute_timing(ts))
+            return make_record(
+                username, status, http_code, round(lat_ms, 1),
+                reason, proxy_val, token_id(token_item['value']),
+                attempts_made, compute_timing(ts)
+            )
 
-        if status == 'token_dead':
+        if status in TOKEN_FAULT:
             token_pool.report(token_item, 'dead')
             if proxy_item:
-                proxy_pool.report(proxy_item, 'error')
-        elif status == 'proxy_dead':
-            token_pool.report(token_item, 'error')
-            if proxy_item:
-                proxy_pool.report(proxy_item, 'dead')
-        elif status == 'tls_error':
-            token_pool.report(token_item, 'error')
+                proxy_pool.report(proxy_item, 'available')
+        elif status in PROXY_FAULT:
             if proxy_item:
                 proxy_pool.report(proxy_item, 'dead')
         elif status == 'rate_limited':
             token_pool.report(token_item, 'rate_limited', ra)
             if proxy_item:
                 proxy_pool.report(proxy_item, 'rate_limited', ra)
-        elif status in ('forbidden', 'not_found'):
-            token_pool.report(token_item, 'forbidden')
-            if proxy_item:
-                proxy_pool.report(proxy_item, 'error')
         else:
-            token_pool.report(token_item, 'error')
-            if proxy_item:
-                proxy_pool.report(proxy_item, 'error')
+            pass
 
-        last = make_record(username, status, http_code, round(lat_ms, 1),
-                           reason, proxy_val, token_id(token_item['value']),
-                           attempts_made, compute_timing(ts))
+        last = make_record(
+            username, status, http_code, round(lat_ms, 1),
+            reason, proxy_val, token_id(token_item['value']),
+            attempts_made, compute_timing(ts)
+        )
+        last_reason = reason or status
 
-    if last is None:
-        ts['done'] = time.perf_counter()
-        last = make_record(username, 'error', 0, 0.0, 'no_attempt_made',
-                           None, None, attempts_made, compute_timing(ts))
-    else:
-        ts['done'] = time.perf_counter()
-        if 'timing' in last and isinstance(last['timing'], dict):
-            last['timing'].update({
-                'total_ms': round((ts['done'] - ts['enqueue']) * 1000, 1),
-            })
-        else:
-            last['timing'] = compute_timing(ts)
-    return last
+    ts['done'] = time.perf_counter()
+
+    if last is not None:
+        if isinstance(last.get('timing'), dict):
+            last['timing']['total_ms'] = round(
+                (ts['done'] - ts['enqueue']) * 1000, 1)
+        return last
+
+    return make_record(
+        username, 'error', 0, 0.0, last_reason,
+        None, None, attempts_made, compute_timing(ts)
+    )
 
 
 # ======================== SCRAPER / VALIDATOR ========================
@@ -938,8 +992,8 @@ def run_checks(usernames, tokens, proxies, concurrency, max_runtime=None,
                 print(f"[MEM] RSS={rss:.0f}MB > {RSS_WARN_MB}MB")
             print(f"[STATS{tag}] {d}/{total} {pct:.1f}% rps={rps:.2f} "
                   f"rss={rss:.0f}MB "
-                  f"tok[a={ts['alive']} c={ts['cooldown']} d={ts['dead']}] "
-                  f"prx[a={ps['alive']} c={ps['cooldown']} d={ps['dead']}] "
+                  f"tok[a={ts['alive']} b={ts['busy']} c={ts['cooldown']} d={ts['dead']}] "
+                  f"prx[a={ps['alive']} b={ps['busy']} c={ps['cooldown']} d={ps['dead']}] "
                   f"paused={svc['currently_paused']} avail={av}")
 
     stats_thread = threading.Thread(target=stats_loop, daemon=True)
@@ -1045,8 +1099,7 @@ def run_checks(usernames, tokens, proxies, concurrency, max_runtime=None,
     print(f"[DONE{tag}] by_status={m.get('by_status')}")
     print(f"[DONE{tag}] by_reason={m.get('by_reason')}")
 
-    SESSION_POOL.close_all()
-    return result, available
+    return result, available, token_pool, proxy_pool
 
 
 # ======================== MAIN ========================
@@ -1084,26 +1137,33 @@ def main():
         if not os.path.exists('usernames.txt'):
             print("usernames.txt not found")
             return
-        usernames_iter = iter([u.lower() for u in load_lines('usernames.txt')])
-        total_expected = None
+        usernames_list = [u.lower() for u in load_lines('usernames.txt')]
     elif choice in length_map:
         m = input("Mode [random/sequential] (random): ").strip().lower()
         if m not in ('random', 'sequential'):
             m = 'random'
         lim = input(f"Limit [{MAX_GENERATE}]: ").strip()
         lim = int(lim) if lim.isdigit() else MAX_GENERATE
-        usernames_iter = generate_usernames(
-            length_map[choice], charsets[type_map[choice]], m, lim)
-        total_expected = lim
+        usernames_list = list(generate_usernames(
+            length_map[choice], charsets[type_map[choice]], m, lim))
     else:
         print("Invalid choice")
+        return
+
+    if not usernames_list:
+        print("Empty list")
         return
 
     done, broken = load_done_usernames(RESULTS_FILE)
     if broken:
         print(f"[RESUME] Broken JSONL lines ignored: {broken}")
     if done:
-        print(f"[RESUME] Terminal results loaded: {len(done)}")
+        before = len(usernames_list)
+        usernames_list = [u for u in usernames_list if u not in done]
+        print(f"[RESUME] Skipping terminal results: {before - len(usernames_list)}")
+        if not usernames_list:
+            print("All usernames have terminal results. Delete results.jsonl to rerun.")
+            return
 
     tokens_path = input("Tokens file [tokens.txt]: ").strip() or 'tokens.txt'
     if not os.path.exists(tokens_path):
@@ -1118,26 +1178,13 @@ def main():
 
     proxy_list = acquire_proxy_list()
 
-    def fresh_iter():
-        for u in usernames_iter:
-            if u not in done:
-                yield u
-            else:
-                pass
-
     if mode == '2':
-        # Benchmark: capture a fixed subset, run with two configs
         subset_n = int(input("Benchmark subset size [200]: ").strip() or "200")
-        subset = []
-        for u in fresh_iter():
-            subset.append(u)
-            if len(subset) >= subset_n:
-                break
+        subset = usernames_list[:subset_n]
         print(f"[BENCH] Subset: {len(subset)}")
         if not subset:
             return
 
-        configs = []
         c1 = int(input(f"Config 1 concurrency [{CONCURRENCY}]: ").strip() or CONCURRENCY)
         c2 = int(input(f"Config 2 concurrency [{CONCURRENCY*2}]: ").strip() or CONCURRENCY*2)
         configs = [('c=%d' % c1, c1), ('c=%d' % c2, c2)]
@@ -1148,7 +1195,7 @@ def main():
                 os.remove(RESULTS_FILE)
             except FileNotFoundError:
                 pass
-            r, _ = run_checks(subset, tokens, proxy_list, conc, tag=f':{tag}')
+            r, _, _, _ = run_checks(subset, tokens, proxy_list, conc, tag=f':{tag}')
             results[tag] = r
 
         best = max(results.items(), key=lambda kv: kv[1]['rps'])
@@ -1166,20 +1213,36 @@ def main():
         print(f"[BENCH] Saved -> {BENCH_FILE}")
         return
 
-    # Normal check mode
-    result, available = run_checks(list(fresh_iter()), tokens, proxy_list, CONCURRENCY)
+    suggested = min(len(tokens) * 2, 20)
+    conc_input = input(f"Concurrency [{suggested}]: ").strip()
+    concurrency = int(conc_input) if conc_input.isdigit() else suggested
+
+    result, available, token_pool, proxy_pool = run_checks(
+        usernames_list, tokens, proxy_list, concurrency)
 
     with open('available.txt', 'w', encoding='utf-8') as f:
         if available:
             f.write('\n'.join(available))
     print(f"available.txt updated ({len(available)} this session)")
 
+    dead_tokens = token_pool.dead_list()
     with open('dead_tokens.txt', 'w', encoding='utf-8') as f:
-        dl = Pool([], 'token').dead_list()  # placeholder, will be empty
-    # real dead lists not exposed here; kept for parity with prior versions
+        if dead_tokens:
+            f.write('\n'.join(dead_tokens))
+    if dead_tokens:
+        print(f"Saved {len(dead_tokens)} dead tokens -> dead_tokens.txt")
+
+    dead_proxies = proxy_pool.dead_list()
+    with open('dead_proxies.txt', 'w', encoding='utf-8') as f:
+        if dead_proxies:
+            f.write('\n'.join(dead_proxies))
+    if dead_proxies:
+        print(f"Saved {len(dead_proxies)} dead proxies -> dead_proxies.txt")
 
     with open(STATE_FILE, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2)
+
+    SESSION_POOL.close_all()
 
     print("")
     print("Note: 'available' = Discord reports username not taken.")
