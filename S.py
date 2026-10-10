@@ -126,6 +126,51 @@ def rss_mb():
     return 0.0
 
 
+# ======================== AUTO-SCALE SAFE CONFIG ========================
+
+def compute_safe_config(size, kind):
+    """
+    Auto-scales safety thresholds based on pool size.
+    A small pool must NOT enter aggressive rest mode - it would starve.
+    """
+    if kind == 'token':
+        if size <= 1:
+            return {'max_per_window': None, 'window_s': 60,
+                    'min_gap': 0.5, 'rest_after': None,
+                    'rest_duration': 0.0, 'rest_jitter': 0.0}
+        if size <= 3:
+            return {'max_per_window': 30, 'window_s': 60,
+                    'min_gap': 1.0, 'rest_after': 25,
+                    'rest_duration': 20.0, 'rest_jitter': 0.3}
+        if size <= 10:
+            return {'max_per_window': 20, 'window_s': 60,
+                    'min_gap': 1.5, 'rest_after': 10,
+                    'rest_duration': 30.0, 'rest_jitter': 0.35}
+        return {'max_per_window': SAFE_TOKEN_MAX_PER_WINDOW, 'window_s': SAFE_TOKEN_WINDOW_S,
+                'min_gap': SAFE_TOKEN_MIN_GAP, 'rest_after': SAFE_TOKEN_REST_AFTER,
+                'rest_duration': SAFE_TOKEN_REST_S, 'rest_jitter': SAFE_TOKEN_JITTER}
+    else:
+        if size <= 1:
+            return {'max_per_window': None, 'window_s': 60,
+                    'min_gap': 0.3, 'rest_after': None,
+                    'rest_duration': 0.0, 'rest_jitter': 0.0}
+        if size <= 5:
+            return {'max_per_window': 40, 'window_s': 60,
+                    'min_gap': 0.5, 'rest_after': 40,
+                    'rest_duration': 15.0, 'rest_jitter': 0.25}
+        if size <= 20:
+            return {'max_per_window': 25, 'window_s': 60,
+                    'min_gap': 0.8, 'rest_after': 20,
+                    'rest_duration': 20.0, 'rest_jitter': 0.25}
+        if size <= 100:
+            return {'max_per_window': SAFE_PROXY_MAX_PER_WINDOW, 'window_s': SAFE_PROXY_WINDOW_S,
+                    'min_gap': SAFE_PROXY_MIN_GAP, 'rest_after': SAFE_PROXY_REST_AFTER,
+                    'rest_duration': SAFE_PROXY_REST_S, 'rest_jitter': SAFE_PROXY_JITTER}
+        return {'max_per_window': SAFE_PROXY_MAX_PER_WINDOW, 'window_s': SAFE_PROXY_WINDOW_S,
+                'min_gap': 1.0, 'rest_after': 5,
+                'rest_duration': SAFE_PROXY_REST_S, 'rest_jitter': SAFE_PROXY_JITTER}
+
+
 # ======================== GLOBAL RATE LIMITER ========================
 
 class RateLimiter:
@@ -259,7 +304,7 @@ class Metrics:
         return out
 
 
-# ======================== POOL (with proactive rotation) ========================
+# ======================== POOL ========================
 
 class Pool:
     def __init__(self, values, name,
@@ -273,7 +318,6 @@ class Pool:
         self.fail_limit = MAX_PROXY_FAILS if name == 'proxy' else MAX_TOKEN_FAILS
         self.lease_timeout = TIMEOUT + 5
 
-        # Safe rotation config
         self.max_per_window = max_per_window
         self.window_s = max(1, window_s)
         self.min_gap = max(0.0, min_gap)
@@ -361,7 +405,6 @@ class Pool:
             self._refresh_cooldowns_locked(now)
             n = len(self.items)
 
-            # First pass: pick a fully safe item
             for _ in range(n):
                 self.idx = (self.idx + 1) % n
                 it = self.items[self.idx]
@@ -369,13 +412,11 @@ class Pool:
                     self._lease_locked(it, now)
                     return it
 
-            # Second pass: mark any exhausted items as resting
             for it in self.items:
                 if (it['status'] == 'alive' and self.rest_after is not None
                         and it['requests_since_rest'] >= self.rest_after):
                     self._trigger_rest_locked(it, now)
 
-            # Third pass: try again in case rests freed nothing new
             for _ in range(n):
                 self.idx = (self.idx + 1) % n
                 it = self.items[self.idx]
@@ -409,7 +450,6 @@ class Pool:
                        for it in self.items)
 
     def next_ready_delta(self):
-        """Time until any alive item becomes safe again."""
         with self.lock:
             now = time.time()
             deltas = []
@@ -999,13 +1039,25 @@ def check_with_retry(username, token_pool, proxy_pool, limiter, t_enqueue,
     attempts_made = 0
     last_reason = 'no_attempt'
 
+    token_wait = max(ACQUIRE_MAX_WAIT, min(120, token_pool.lease_timeout * 2))
+    proxy_wait = max(ACQUIRE_MAX_WAIT, min(120, proxy_pool.lease_timeout * 2))
+
     for _ in range(MAX_RETRIES):
         limiter.wait_if_paused()
 
-        token_item = acquire(token_pool, ACQUIRE_MAX_WAIT)
+        token_item = acquire(token_pool, token_wait)
         ts['token_ok'] = time.perf_counter()
+
         if token_item is None:
-            last_reason = 'no_token_available'
+            stats = token_pool.stats()
+            if stats['total'] == 0:
+                last_reason = 'no_tokens_in_pool'
+            elif stats['resting'] + stats['busy'] >= stats['total']:
+                last_reason = 'all_tokens_resting'
+            elif stats['dead'] >= stats['total']:
+                last_reason = 'all_tokens_dead'
+            else:
+                last_reason = 'token_wait_timeout'
             break
         if token_item['value'] in used_tokens:
             token_pool.release(token_item)
@@ -1015,11 +1067,17 @@ def check_with_retry(username, token_pool, proxy_pool, limiter, t_enqueue,
 
         proxy_item = None
         if use_proxy:
-            proxy_item = acquire(proxy_pool, ACQUIRE_MAX_WAIT)
+            proxy_item = acquire(proxy_pool, proxy_wait)
             ts['proxy_ok'] = time.perf_counter()
             if proxy_item is None:
+                stats = proxy_pool.stats()
+                if stats['total'] == 0:
+                    last_reason = 'no_proxies_in_pool'
+                elif stats['resting'] + stats['busy'] >= stats['total']:
+                    last_reason = 'all_proxies_resting'
+                else:
+                    last_reason = 'proxy_wait_timeout'
                 token_pool.release(token_item)
-                last_reason = 'no_proxy_available'
                 break
             if proxy_item['value'] in used_proxies:
                 token_pool.release(token_item)
@@ -1461,25 +1519,16 @@ def acquire_token_list(proxy_scored):
 
 def run_checks(usernames, tokens, proxy_scored, concurrency, max_runtime=None,
                verbose=False, tag='', enable_health_check=True):
-    token_pool = Pool(
-        tokens, 'token',
-        max_per_window=SAFE_TOKEN_MAX_PER_WINDOW if SAFE_MODE else None,
-        window_s=SAFE_TOKEN_WINDOW_S,
-        min_gap=SAFE_TOKEN_MIN_GAP if SAFE_MODE else 0.0,
-        rest_after=SAFE_TOKEN_REST_AFTER if SAFE_MODE else None,
-        rest_duration=SAFE_TOKEN_REST_S,
-        rest_jitter=SAFE_TOKEN_JITTER,
-    )
+    no_safe = {'max_per_window': None, 'window_s': 60, 'min_gap': 0.0,
+               'rest_after': None, 'rest_duration': 0.0, 'rest_jitter': 0.0}
+
+    token_cfg = compute_safe_config(len(tokens), 'token') if SAFE_MODE else dict(no_safe)
+    token_pool = Pool(tokens, 'token', **token_cfg)
+
     proxy_urls = [p for p, _, _ in proxy_scored] if proxy_scored else []
-    proxy_pool = Pool(
-        proxy_urls, 'proxy',
-        max_per_window=SAFE_PROXY_MAX_PER_WINDOW if SAFE_MODE else None,
-        window_s=SAFE_PROXY_WINDOW_S,
-        min_gap=SAFE_PROXY_MIN_GAP if SAFE_MODE else 0.0,
-        rest_after=SAFE_PROXY_REST_AFTER if SAFE_MODE else None,
-        rest_duration=SAFE_PROXY_REST_S,
-        rest_jitter=SAFE_PROXY_JITTER,
-    )
+    proxy_cfg = compute_safe_config(len(proxy_urls), 'proxy') if SAFE_MODE else dict(no_safe)
+    proxy_pool = Pool(proxy_urls, 'proxy', **proxy_cfg)
+
     if proxy_scored:
         score_map = {}
         for p, lat, sc in proxy_scored:
@@ -1509,6 +1558,8 @@ def run_checks(usernames, tokens, proxy_scored, concurrency, max_runtime=None,
     print(f"[RUN{tag}] usernames={total} tokens={token_pool.size()} "
           f"proxies={proxy_pool.size()} concurrency={concurrency} "
           f"safe_mode={SAFE_MODE} global_rps={GLOBAL_MAX_RPS}")
+    print(f"[RUN{tag}] token_cfg={token_cfg}")
+    print(f"[RUN{tag}] proxy_cfg={proxy_cfg}")
 
     def stats_loop():
         while not stop_stats.wait(STATS_INTERVAL):
@@ -1622,6 +1673,8 @@ def run_checks(usernames, tokens, proxy_scored, concurrency, max_runtime=None,
         'concurrency': concurrency,
         'safe_mode': SAFE_MODE,
         'tls_verify': VERIFY_TLS,
+        'token_cfg': token_cfg,
+        'proxy_cfg': proxy_cfg,
     }
     if health:
         result['health_check'] = health.stats
@@ -1632,6 +1685,8 @@ def run_checks(usernames, tokens, proxy_scored, concurrency, max_runtime=None,
     print(f"[DONE{tag}] latency avg={m.get('avg_ms')} p50={m.get('p50_ms')} "
           f"p95={m.get('p95_ms')} p99={m.get('p99_ms')}")
     print(f"[DONE{tag}] by_status={m.get('by_status')}")
+    if m.get('by_reason'):
+        print(f"[DONE{tag}] by_reason={m.get('by_reason')}")
 
     return result, available, token_pool, proxy_pool
 
@@ -1732,7 +1787,7 @@ def main():
             json.dump(results, f, indent=2)
         return
 
-    suggested = min(len(tokens) * 2, 20)
+    suggested = min(max(1, len(tokens)) * 2, 20)
     conc_input = input(f"Concurrency [{suggested}]: ").strip()
     concurrency = int(conc_input) if conc_input.isdigit() else suggested
 
