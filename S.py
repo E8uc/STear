@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Discord Username Checker V10.1 — iSH compatible
+Discord Username Checker V10.2 — iSH optimized
 """
 import os
 import sys
@@ -73,31 +73,38 @@ USER_AGENTS = [
 
 VERIFY_TLS = True
 
+# iSH-friendly caps
 CHECK_WORKERS     = 20
-VALIDATE_WORKERS  = 100
+VALIDATE_WORKERS  = 200
 SCRAPE_WORKERS    = 10
+MAX_PROXIES_TO_VALIDATE = 8000
 
-TCP_LIMIT          = 200
-TCP_LIMIT_PER_HOST = 20
+# HTTP pool
+TCP_LIMIT          = 300
+TCP_LIMIT_PER_HOST = 25
 DNS_CACHE_TTL      = 300
 KEEPALIVE_TIMEOUT  = 30
 
+# SOCKS pool
 MAX_SOCKS_SESSIONS  = 100
 SOCKS_PER_CONNECTOR = 10
 SOCKS_PER_HOST      = 3
 
+# Timeouts
 TIMEOUT_CONNECT    = 8
 TIMEOUT_TOTAL      = 20
-TCP_STAGE_TIMEOUT  = 3.0
+TCP_STAGE_TIMEOUT  = 1.5
 HTTPS_STAGE_TMO    = 8.0
 DISCORD_STAGE_TMO  = 10.0
 
+# Proxy health
 PROXY_MAX_PER_MIN   = 15
 PROXY_MIN_GAP       = 1.0
 PROXY_COOLDOWN_S    = 45
 PROXY_FAIL_LIMIT    = 5
 PROXY_SUSPECT_LIMIT = 3
 
+# Files
 RESULTS_FILE   = "results.jsonl"
 HITS_FILE      = "available.txt"
 CACHE_FILE     = "validated_proxies.json"
@@ -120,7 +127,7 @@ def log(msg, style=""):
         if RICH:
             console.print(msg, style=style, highlight=False)
         else:
-            print(msg)
+            print(msg, flush=True)
 
 
 def plog(tag, ident, idx, extra=""):
@@ -134,7 +141,7 @@ def plog(tag, ident, idx, extra=""):
                 highlight=False,
             )
         else:
-            print(f"[ {tag} ] [ Api ] | {ident} | #{idx:05d} {extra}")
+            print(f"[ {tag} ] [ Api ] | {ident} | #{idx:05d} {extra}", flush=True)
 
 
 # ==================== STATE ====================
@@ -599,7 +606,8 @@ async def scrape_all(sm):
     async def fetch(tag, url, proto_hint):
         async with sem:
             try:
-                async with sm.request("GET", url) as r:
+                async with sm.request("GET", url,
+                                       timeout=aiohttp.ClientTimeout(total=40)) as r:
                     if r.status != 200:
                         log(f"[dim]  {tag}: HTTP {r.status}[/]")
                         return
@@ -741,9 +749,16 @@ async def validate_all(sm, proxies):
 
     log(f"[yellow]Stage 0: TCP on {len(items)}[/]")
     stage1: List[Proxy] = []
+    counter = [0]
+    total_items = len(items)
 
     async def s0(p):
         ok = await _tcp_probe(p.key.host, p.key.port, TCP_STAGE_TIMEOUT)
+        counter[0] += 1
+        if counter[0] % 500 == 0:
+            pct = counter[0] * 100 / total_items
+            log(f"[dim]  Stage0: {counter[0]}/{total_items} "
+                f"({pct:.0f}%) alive={len(stage1)}[/]")
         return p if ok else None
 
     await _bounded_map(items, s0, VALIDATE_WORKERS,
@@ -754,9 +769,16 @@ async def validate_all(sm, proxies):
 
     log(f"[yellow]Stage 1: HTTPS on {len(stage1)}[/]")
     stage2: List[Tuple[Proxy, float]] = []
+    counter1 = [0]
+    total1 = len(stage1)
 
     async def s1(p):
         ok, lat = await _stage_https(sm, p, HTTPS_STAGE_TMO)
+        counter1[0] += 1
+        if counter1[0] % 100 == 0:
+            pct = counter1[0] * 100 / total1
+            log(f"[dim]  Stage1: {counter1[0]}/{total1} "
+                f"({pct:.0f}%) alive={len(stage2)}[/]")
         return (p, lat) if ok else None
 
     await _bounded_map(stage1, s1, VALIDATE_WORKERS,
@@ -767,10 +789,17 @@ async def validate_all(sm, proxies):
 
     log(f"[yellow]Stage 2: Discord on {len(stage2)}[/]")
     stage3: List[Tuple[Proxy, float]] = []
+    counter2 = [0]
+    total2 = len(stage2)
 
     async def s2(item):
         p, h_lat = item
         ok, d_lat = await _stage_discord(sm, p, DISCORD_STAGE_TMO)
+        counter2[0] += 1
+        if counter2[0] % 50 == 0:
+            pct = counter2[0] * 100 / total2
+            log(f"[dim]  Stage2: {counter2[0]}/{total2} "
+                f"({pct:.0f}%) alive={len(stage3)}[/]")
         return (p, (h_lat + d_lat) / 2) if ok else None
 
     await _bounded_map(stage2, s2, VALIDATE_WORKERS,
@@ -1236,6 +1265,15 @@ class Suite:
             proxies = cached
         else:
             raw = await scrape_all(self.sm)
+
+            # Cap for iSH responsiveness
+            if len(raw) > MAX_PROXIES_TO_VALIDATE:
+                keys = random.sample(list(raw.keys()), MAX_PROXIES_TO_VALIDATE)
+                raw_sampled = {k: raw[k] for k in keys}
+                log(f"[yellow]Capped {len(raw)} → "
+                    f"{len(raw_sampled)} for validation[/]")
+                raw = raw_sampled
+
             proxies = await validate_all(self.sm, raw)
             save_cache(proxies)
 
@@ -1353,8 +1391,8 @@ class Suite:
 def _prompt_mode():
     if RICH:
         console.print(Panel.fit(
-            "[bold cyan]Discord Username Checker V10.1[/]\n"
-            "[dim]Tokenless · iSH-friendly · SOCKS5/HTTP[/]",
+            "[bold cyan]Discord Username Checker V10.2[/]\n"
+            "[dim]Tokenless · iSH-optimized · SOCKS5/HTTP[/]",
             border_style="cyan"))
         console.print("\n[bold]Mode:[/] "
                       "[yellow]4l[/] [yellow]4c[/] [yellow]4n[/]  "
