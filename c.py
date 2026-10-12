@@ -87,19 +87,19 @@ def instaa(user):
 ☆━━━━━━━━━━━━━━☆"""
         requests.post(f'https://api.telegram.org/bot{token}/sendMessage?chat_id={id}&text={god}')
 def users():
-    ran1="1234567890..__qwertyuiopasdfghjklzxvcbnm__.."
+    chars = "1234567890qwertyuiopasdfghjklzxcvbnm"
+    symbols = "._"
+
     while True:
-               v1 = str(''.join((random.choice(insta) for i in range(1))))
-               v2 = str(''.join((random.choice(insta) for i in range(1))))
-               v3 = str(''.join((random.choice(insta) for i in range(1))))
-               v4 = str(''.join((random.choice(all) for i in range(1))))
-               user1 = (v1+v2+v3+v4)
-               user2 = (v1+v2+v3+v4)
-               user3 = (v1+v2+v3+v4)
-               user4 = (v1+v2+v3+v4)
-               hamo010 = (user1, user2, user3, user4)
-               user = random.choice(hamo010)
-               instaa(user)
+        length = 4
+
+        user = ''.join(
+            random.choice(chars if i == 0 or i == length - 1
+                          else chars + symbols)
+            for i in range(length)
+        )
+
+        instaa(user)
 id=input(f"{F} TELEGRAM USER ID ➤ {C}")
 token=input(f"{F} TELEGRAM BOT TOKEN ➤ {C}")
 print(dead)
