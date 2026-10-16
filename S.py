@@ -1,11 +1,7 @@
+cat > /root/GTead/S.py << 'PYEOF'
 #!/usr/bin/env python3
 """
-Discord Username Checker V11 — Residential Proxies Edition
-- Loads from proxies.txt (no scraping)
-- Skips validation (residential = always alive)
-- High concurrency (safe with residential)
-- Bandwidth tracking (stops at limit)
-- No proxy kill on 429/403 (cooldown only)
+Discord Username Checker V11 - Residential Proxies Edition
 """
 import os
 import sys
@@ -48,12 +44,8 @@ except ImportError:
     pass
 
 
-# ==================== ENDPOINTS ====================
 API_TOKENLESS = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
-API_IPIFY     = "https://api.ipify.org?format=json"
 
-
-# ==================== CONFIG ====================
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
@@ -62,48 +54,39 @@ USER_AGENTS = [
 
 VERIFY_TLS = True
 
-# ---- Residential-optimized concurrency ----
-CHECK_WORKERS       = 40        # 40 concurrent requests is safe
-ACQUIRE_MAX_WAIT    = 6.0       # short wait
+CHECK_WORKERS       = 40
+ACQUIRE_MAX_WAIT    = 6.0
 
-# HTTP pool
 TCP_LIMIT           = 500
 TCP_LIMIT_PER_HOST  = 50
 DNS_CACHE_TTL       = 300
 KEEPALIVE_TIMEOUT   = 45
 
-# SOCKS pool
 MAX_SOCKS_SESSIONS  = 300
 SOCKS_PER_CONNECTOR = 20
 SOCKS_PER_HOST      = 10
 
-# Timeouts
 TIMEOUT_CONNECT     = 10
 TIMEOUT_TOTAL       = 18
 
-# Rate safety (residential IPs tolerate more)
-PROXY_MAX_PER_MIN   = 30        # 30 req/min per IP
+PROXY_MAX_PER_MIN   = 30
 PROXY_MIN_GAP       = 0.3
 PROXY_COOLDOWN_S    = 20
-PROXY_FAIL_LIMIT    = 8         # much higher — residential rarely dies
+PROXY_FAIL_LIMIT    = 8
 
-# Files
-PROXY_FILE    = "proxies.txt"
-RESULTS_FILE  = "results.jsonl"
-HITS_FILE     = "available.txt"
+PROXY_FILE     = "proxies.txt"
+RESULTS_FILE   = "results.jsonl"
+HITS_FILE      = "available.txt"
 BANDWIDTH_FILE = "bandwidth.json"
-SESSION_FILE  = "session.json"
+SESSION_FILE   = "session.json"
 
 STATS_INTERVAL = 5
 
-# Bandwidth management
-BANDWIDTH_LIMIT_GB = 100.0
-BANDWIDTH_WARN_GB  = 5.0        # warn when remaining < this
-AVG_REQUEST_KB     = 3.5        # estimated size per request
-STOP_AT_REMAINING_GB = 0.5      # stop with this much buffer left
+BANDWIDTH_LIMIT_GB   = 100.0
+BANDWIDTH_WARN_GB    = 5.0
+STOP_AT_REMAINING_GB = 0.5
 
 
-# ==================== LOGGER ====================
 _log_lk = threading.Lock()
 
 
@@ -120,16 +103,15 @@ def plog(tag, ident, idx, extra=""):
     with _log_lk:
         if RICH:
             console.print(
-                f"[{colors.get(tag, 'white')}][ {tag} ][/] "
-                f"[dim][ Api ][/] | [white]{ident}[/] | "
-                f"[dim]#{idx:05d}[/] {extra}",
+                "[" + colors.get(tag, "white") + "][ " + tag + " ][/] "
+                "[dim][ Api ][/] | [white]" + ident + "[/] | "
+                "[dim]#" + ("%05d" % idx) + "[/] " + extra,
                 highlight=False,
             )
         else:
-            print(f"[ {tag} ] [ Api ] | {ident} | #{idx:05d} {extra}", flush=True)
+            print("[ " + tag + " ] [ Api ] | " + ident + " | #" + ("%05d" % idx) + " " + extra, flush=True)
 
 
-# ==================== STATE ====================
 class State:
     def __init__(self):
         self.reset()
@@ -138,7 +120,7 @@ class State:
         self.stop = threading.Event()
         self.counters = defaultdict(int)
         self.counters_lock = threading.Lock()
-        self.hits: List[str] = []
+        self.hits = []
         self.hits_lock = threading.Lock()
         self.bytes_used = 0
         self.bytes_lock = threading.Lock()
@@ -171,7 +153,6 @@ class State:
 STATE = State()
 
 
-# ==================== PROXY MODEL ====================
 @dataclass(frozen=True)
 class ProxyKey:
     protocol: str
@@ -199,19 +180,18 @@ class Proxy:
         if self.key.user is not None:
             u = quote(self.key.user, safe="")
             pw = quote(self.key.password or "", safe="")
-            return f"{self.key.protocol}://{u}:{pw}@{self.key.host}:{self.key.port}"
-        return f"{self.key.protocol}://{self.key.host}:{self.key.port}"
+            return self.key.protocol + "://" + u + ":" + pw + "@" + self.key.host + ":" + str(self.key.port)
+        return self.key.protocol + "://" + self.key.host + ":" + str(self.key.port)
 
     @property
     def safe_url(self):
-        return f"{self.key.protocol}://{self.key.host}:{self.key.port}"
+        return self.key.protocol + "://" + self.key.host + ":" + str(self.key.port)
 
 
-# ==================== PARSER ====================
 _SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*)://")
 
 
-def _validate_host(h: str) -> bool:
+def _validate_host(h):
     h = h.strip()
     if not h or len(h) > 253:
         return False
@@ -230,7 +210,7 @@ def _validate_host(h: str) -> bool:
         r"(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$", h))
 
 
-def _validate_port(p) -> Optional[int]:
+def _validate_port(p):
     try:
         v = int(p)
     except (TypeError, ValueError):
@@ -238,14 +218,7 @@ def _validate_port(p) -> Optional[int]:
     return v if 0 < v < 65536 else None
 
 
-def parse_proxy_line(line: str, proto_hint: str = "http") -> Optional[ProxyKey]:
-    """
-    Supports residential formats:
-        user:pass@host:port
-        host:port:user:pass
-        http://user:pass@host:port
-        socks5://user:pass@host:port
-    """
+def parse_proxy_line(line, proto_hint="http"):
     line = line.strip()
     if not line or line.startswith("#"):
         return None
@@ -265,11 +238,10 @@ def parse_proxy_line(line: str, proto_hint: str = "http") -> Optional[ProxyKey]:
     elif "@" in line:
         creds, hostport = line.split("@", 1)
     else:
-        # host:port:user:pass format
         parts = line.split(":")
         if len(parts) == 4:
-            hostport = f"{parts[0]}:{parts[1]}"
-            creds = f"{parts[2]}:{parts[3]}"
+            hostport = parts[0] + ":" + parts[1]
+            creds = parts[2] + ":" + parts[3]
         else:
             hostport = line
 
@@ -293,7 +265,8 @@ def parse_proxy_line(line: str, proto_hint: str = "http") -> Optional[ProxyKey]:
     if port is None:
         return None
 
-    user = password = None
+    user = None
+    password = None
     if creds:
         if ":" in creds:
             user, password = creds.split(":", 1)
@@ -313,15 +286,12 @@ def parse_proxy_line(line: str, proto_hint: str = "http") -> Optional[ProxyKey]:
     if proto in ("socks4", "socks5") and not SOCKS_OK:
         return None
 
-    return ProxyKey(protocol=proto, host=host, port=port,
-                    user=user, password=password)
+    return ProxyKey(protocol=proto, host=host, port=port, user=user, password=password)
 
 
-# ==================== PROXY POOL ====================
 class ProxyPool:
     def __init__(self, proxies):
         self._lock = asyncio.Lock()
-        # Round-robin order — shuffle once for even distribution
         self.items = list(proxies)
         random.shuffle(self.items)
         self.idx = -1
@@ -346,7 +316,7 @@ class ProxyPool:
             return False
         return True
 
-    async def acquire(self, max_wait: float = ACQUIRE_MAX_WAIT):
+    async def acquire(self, max_wait=ACQUIRE_MAX_WAIT):
         if not self.items:
             return None
 
@@ -393,7 +363,6 @@ class ProxyPool:
             p.bytes_used += bytes_used
 
     async def report_cooldown(self, p, seconds):
-        """Residential: cooldown, NEVER kill."""
         if p is None:
             return
         async with self._lock:
@@ -401,7 +370,6 @@ class ProxyPool:
             p.cooldown_until = time.time() + seconds
 
     async def report_fail(self, p):
-        """Residential proxies should rarely be killed."""
         if p is None:
             return
         async with self._lock:
@@ -416,18 +384,15 @@ class ProxyPool:
         return {
             "total": len(self.items),
             "alive": sum(1 for p in self.items if p.status == "alive"),
-            "cooldown": sum(1 for p in self.items
-                            if p.status == "cooldown"
-                            and p.cooldown_until > now),
+            "cooldown": sum(1 for p in self.items if p.status == "cooldown" and p.cooldown_until > now),
             "dead": 0,
         }
 
 
-# ==================== SESSION MANAGER ====================
 class SessionManager:
     def __init__(self):
         self._http = None
-        self._socks = OrderedDict()  # url -> [session, refcount]
+        self._socks = OrderedDict()
         self._lock = asyncio.Lock()
         self._closed = False
 
@@ -445,8 +410,7 @@ class SessionManager:
             )
             self._http = aiohttp.ClientSession(
                 connector=connector,
-                timeout=aiohttp.ClientTimeout(
-                    total=TIMEOUT_TOTAL, connect=TIMEOUT_CONNECT),
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT_TOTAL, connect=TIMEOUT_CONNECT),
             )
         return self._http
 
@@ -466,8 +430,8 @@ class SessionManager:
                 idle = [k for k, e in self._socks.items() if e[1] == 0]
                 if not idle:
                     raise RuntimeError("SOCKS pool full")
-                _, [old, _] = self._socks.pop(idle[0])
-                asyncio.create_task(self._safe_close(old))
+                _, entry = self._socks.pop(idle[0])
+                asyncio.create_task(self._safe_close(entry[0]))
 
             connector = ProxyConnector.from_url(
                 url, ssl=VERIFY_TLS, rdns=True,
@@ -475,8 +439,7 @@ class SessionManager:
             )
             sess = aiohttp.ClientSession(
                 connector=connector,
-                timeout=aiohttp.ClientTimeout(
-                    total=TIMEOUT_TOTAL, connect=TIMEOUT_CONNECT),
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT_TOTAL, connect=TIMEOUT_CONNECT),
             )
             self._socks[url] = [sess, 1]
             return sess
@@ -502,7 +465,7 @@ class SessionManager:
             return _SocksReq(self, proxy.url, method, url, **kw)
         return _HttpProxyReq(self, proxy.url, method, url, **kw)
 
-    async def close(self, timeout: float = 15.0):
+    async def close(self, timeout=15.0):
         async with self._lock:
             if self._closed:
                 return
@@ -533,39 +496,63 @@ class SessionManager:
 
 class _DirectReq:
     __slots__ = ("_sm", "_m", "_u", "_kw", "_cm")
+
     def __init__(self, sm, m, u, **kw):
-        self._sm, self._m, self._u, self._kw, self._cm = sm, m, u, kw, None
+        self._sm = sm
+        self._m = m
+        self._u = u
+        self._kw = kw
+        self._cm = None
+
     async def __aenter__(self):
         s = await self._sm._http_session()
         self._cm = s.request(self._m, self._u, **self._kw)
         return await self._cm.__aenter__()
+
     async def __aexit__(self, *e):
-        if self._cm: return await self._cm.__aexit__(*e)
+        if self._cm:
+            return await self._cm.__aexit__(*e)
 
 
 class _HttpProxyReq:
     __slots__ = ("_sm", "_p", "_m", "_u", "_kw", "_cm")
+
     def __init__(self, sm, p, m, u, **kw):
-        self._sm, self._p, self._m, self._u, self._kw, self._cm = sm, p, m, u, kw, None
+        self._sm = sm
+        self._p = p
+        self._m = m
+        self._u = u
+        self._kw = kw
+        self._cm = None
+
     async def __aenter__(self):
         s = await self._sm._http_session()
         self._cm = s.request(self._m, self._u, proxy=self._p, **self._kw)
         return await self._cm.__aenter__()
+
     async def __aexit__(self, *e):
-        if self._cm: return await self._cm.__aexit__(*e)
+        if self._cm:
+            return await self._cm.__aexit__(*e)
 
 
 class _SocksReq:
     __slots__ = ("_sm", "_p", "_m", "_u", "_kw", "_cm", "_acq")
+
     def __init__(self, sm, p, m, u, **kw):
-        self._sm, self._p, self._m, self._u, self._kw = sm, p, m, u, kw
+        self._sm = sm
+        self._p = p
+        self._m = m
+        self._u = u
+        self._kw = kw
         self._cm = None
         self._acq = False
+
     async def __aenter__(self):
         s = await self._sm._socks_acquire(self._p)
         self._acq = True
         self._cm = s.request(self._m, self._u, **self._kw)
         return await self._cm.__aenter__()
+
     async def __aexit__(self, *e):
         try:
             if self._cm:
@@ -576,7 +563,6 @@ class _SocksReq:
                 await self._sm._socks_release(self._p)
 
 
-# ==================== HEADERS ====================
 def rheaders(extra=None):
     h = {
         "User-Agent": random.choice(USER_AGENTS),
@@ -595,10 +581,9 @@ def rheaders(extra=None):
     return h
 
 
-# ==================== LOAD PROXIES ====================
-def load_proxies_from_file(path: str) -> List[Proxy]:
+def load_proxies_from_file(path):
     if not os.path.exists(path):
-        log(f"[red]Missing file: {path}[/]")
+        log("[red]Missing file: " + path + "[/]")
         return []
 
     proxies = []
@@ -618,12 +603,10 @@ def load_proxies_from_file(path: str) -> List[Proxy]:
             seen.add(key)
             proxies.append(Proxy(key=key))
 
-    log(f"[green]✓[/] Loaded {len(proxies)} proxies from {path} "
-        f"(rejected: {rejected})")
+    log("[green]OK[/] Loaded " + str(len(proxies)) + " proxies from " + path + " (rejected: " + str(rejected) + ")")
     return proxies
 
 
-# ==================== USERNAME ====================
 _ALLOWED = set(string.ascii_lowercase + string.digits + "._")
 
 
@@ -654,7 +637,7 @@ def generate_usernames(mode, limit):
         "2n": (string.digits, 2),
     }
     if mode not in modes:
-        raise ValueError(f"Unknown mode: {mode}")
+        raise ValueError("Unknown mode: " + mode)
     if limit <= 0:
         raise ValueError("limit must be > 0")
 
@@ -662,14 +645,14 @@ def generate_usernames(mode, limit):
     space = len(chars) ** length
     limit = min(limit, space)
 
-    if space <= 100_000:
-        all_items = ["".join(p)
-                     for p in itertools.product(chars, repeat=length)]
+    if space <= 100000:
+        all_items = ["".join(p) for p in itertools.product(chars, repeat=length)]
         valid = [s for s in all_items if valid_username(s)]
         random.shuffle(valid)
         return valid[:limit]
 
-    seen, out = set(), []
+    seen = set()
+    out = []
     max_attempts = limit * 30
     attempts = 0
     while len(out) < limit and attempts < max_attempts:
@@ -682,7 +665,6 @@ def generate_usernames(mode, limit):
     return out
 
 
-# ==================== CLASSIFY ====================
 def classify_response(code, body_text):
     body = {}
     if body_text:
@@ -698,7 +680,7 @@ def classify_response(code, body_text):
         if taken is True:
             return "confirmed_taken", "", "ok", 0.0
         if taken is False:
-            return "confirmed_available", " "", "ok", 0.0
+            return "confirmed_available", "", "ok", 0.0
         return "unknown", "200_unknown_shape", "ok", 0.0
 
     if code == 429:
@@ -707,8 +689,8 @@ def classify_response(code, body_text):
             ra = float(body.get("retry_after", 5.0))
         except Exception:
             pass
-        ra = max(1.0, min(ra, 30.0))  # residential recovers faster
-        return "rate_limited", f"ra={ra:.1f}", "cooldown", ra
+        ra = max(1.0, min(ra, 30.0))
+        return "rate_limited", "ra=" + ("%.1f" % ra), "cooldown", ra
 
     if code in (400, 422):
         cv = body.get("code")
@@ -716,22 +698,20 @@ def classify_response(code, body_text):
             return "confirmed_invalid", "code_50035", "ok", 0.0
         msg = str(body.get("message", "")).lower()
         if "username" in msg and "invalid" in msg:
-            returnconfirmed_invalid", "username_invalid", "ok", 0.0
-        return "client_error", f"http_{code}", "none", 0.0
+            return "confirmed_invalid", "username_invalid", "ok", 0.0
+        return "client_error", "http_" + str(code), "none", 0.0
 
     if code == 401:
         return "client_error", "unauthorized", "ok", 0.0
     if code == 403:
-        # Residential rarely gets 403. Cooldown briefly, don't kill.
         return "forbidden", "forbidden", "cooldown", 15.0
     if code in (407, 502, 503, 504):
-        return "server_error", f"gateway_{code}", "cooldown", 10.0
+        return "server_error", "gateway_" + str(code), "cooldown", 10.0
     if code >= 500:
-        return "server_error", f"http_{code}", "cooldown", 8.0
-    return "unknown", f"http_{code}", "none", 0.0
+        return "server_error", "http_" + str(code), "cooldown", 8.0
+    return "unknown", "http_" + str(code), "none", 0.0
 
 
-# ==================== CHECKER ====================
 class Checker:
     def __init__(self, pp, sm, session_id):
         self.pp = pp
@@ -740,7 +720,7 @@ class Checker:
         self.fp = open(RESULTS_FILE, "a", encoding="utf-8")
         self.fp_lock = asyncio.Lock()
         self.counters = defaultdict(int)
-        self._recorded: Set[int] = set()
+        self._recorded = set()
         self._recorded_lock = asyncio.Lock()
         self.completed = 0
         self._hit_lock = threading.Lock()
@@ -762,7 +742,7 @@ class Checker:
             self.completed += 1
 
         self.counters[status] += 1
-        STATE.inc(f"check_{status}")
+        STATE.inc("check_" + status)
         rec = {
             "session": self.session_id,
             "ts": round(time.time(), 3),
@@ -781,21 +761,20 @@ class Checker:
     async def check_one(self, username, idx):
         if not valid_username(username):
             await self._record(idx, username, "invalid_format", 0, "precheck")
-            plog("Err", f"@{username}", idx, "[dim]invalid[/]")
+            plog("Err", "@" + username, idx, "[dim]invalid[/]")
             return "invalid_format"
 
         proxy = await self.pp.acquire()
         if proxy is None:
             await self._record(idx, username, "no_proxy", 0, "no_alive_proxy")
-            plog("Err", f"@{username}", idx, "[yellow]no_proxy[/]")
+            plog("Err", "@" + username, idx, "[yellow]no_proxy[/]")
             return "no_proxy"
 
         bytes_used = 0
         try:
             headers = rheaders({
                 "Content-Type": "application/json",
-                "X-Fingerprint": hashlib.md5(
-                    f"{random.random()}".encode()).hexdigest(),
+                "X-Fingerprint": hashlib.md5(str(random.random()).encode()).hexdigest(),
             })
             payload = {"username": username}
 
@@ -810,20 +789,19 @@ class Checker:
                 ) as r:
                     status_code = r.status
                     body_text = await r.text()
-                    # Estimate bytes: request + response
                     bytes_used = len(body_text) + len(json.dumps(payload)) + 500
             except asyncio.TimeoutError:
                 await self.pp.report_fail(proxy)
                 await self._record(idx, username, "error", 0, "timeout")
-                plog("Err", f"@{username}", idx, "[dim]timeout[/]")
+                plog("Err", "@" + username, idx, "[dim]timeout[/]")
                 return "error"
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 await self.pp.report_fail(proxy)
-                reason = f"exc:{type(e).__name__}"
+                reason = "exc:" + type(e).__name__
                 await self._record(idx, username, "error", 0, reason)
-                plog("Err", f"@{username}", idx, f"[red]{reason}[/]")
+                plog("Err", "@" + username, idx, "[red]" + reason + "[/]")
                 return "error"
 
             lat_ms = (time.perf_counter() - t0) * 1000
@@ -840,30 +818,30 @@ class Checker:
 
             if kind == "confirmed_available":
                 status = "available"
-                plog("Avb", f"@{username}", idx)
+                plog("Avb", "@" + username, idx)
                 STATE.hit(username)
                 self._write_hit(username)
             elif kind == "confirmed_taken":
                 status = "taken"
-                plog("Usd", f"@{username}", idx)
+                plog("Usd", "@" + username, idx)
             elif kind == "confirmed_invalid":
                 status = "invalid_format"
-                plog("Err", f"@{username}", idx, "[dim]invalid[/]")
+                plog("Err", "@" + username, idx, "[dim]invalid[/]")
             elif kind == "rate_limited":
                 status = "rate_limited"
-                plog("Err", f"@{username}", idx, "[yellow]rate_limited[/]")
+                plog("Err", "@" + username, idx, "[yellow]rate_limited[/]")
             elif kind == "forbidden":
                 status = "forbidden"
-                plog("Err", f"@{username}", idx, "[yellow]forbidden[/]")
+                plog("Err", "@" + username, idx, "[yellow]forbidden[/]")
             elif kind == "server_error":
                 status = "server_error"
-                plog("Err", f"@{username}", idx, f"[yellow]{reason}[/]")
+                plog("Err", "@" + username, idx, "[yellow]" + reason + "[/]")
             elif kind == "client_error":
                 status = "client_error"
-                plog("Err", f"@{username}", idx, f"[red]{reason}[/]")
+                plog("Err", "@" + username, idx, "[red]" + reason + "[/]")
             else:
                 status = "error"
-                plog("Err", f"@{username}", idx, f"[red]{reason}[/]")
+                plog("Err", "@" + username, idx, "[red]" + reason + "[/]")
 
             await self._record(idx, username, status, status_code, reason, lat_ms)
             return status
@@ -893,8 +871,7 @@ class Checker:
                     queue.task_done()
                     raise
                 except Exception as e:
-                    await self._record(idx, u, "error", 0,
-                                       f"unhandled:{type(e).__name__}")
+                    await self._record(idx, u, "error", 0, "unhandled:" + type(e).__name__)
                 finally:
                     queue.task_done()
 
@@ -918,9 +895,7 @@ class Checker:
             pass
 
 
-# ==================== BANDWIDTH ====================
-def load_bandwidth_used() -> float:
-    """Returns cumulative GB used across sessions."""
+def load_bandwidth_used():
     if not os.path.exists(BANDWIDTH_FILE):
         return 0.0
     try:
@@ -930,16 +905,14 @@ def load_bandwidth_used() -> float:
         return 0.0
 
 
-def save_bandwidth_used(gb: float):
+def save_bandwidth_used(gb):
     try:
         with open(BANDWIDTH_FILE, "w") as f:
-            json.dump({"gb_used": round(gb, 4),
-                       "updated": time.time()}, f)
+            json.dump({"gb_used": round(gb, 4), "updated": time.time()}, f)
     except Exception:
         pass
 
 
-# ==================== SUITE ====================
 class Suite:
     def __init__(self):
         STATE.reset()
@@ -967,31 +940,25 @@ class Suite:
                 gb_total = self.starting_gb + gb_session
                 gb_remaining = BANDWIDTH_LIMIT_GB - gb_total
 
-                log(f"[dim cyan]prx[a={ps['alive']} c={ps['cooldown']}] "
-                    f"hits={hits} completed={done} rps={rps:.1f} | "
-                    f"GB[session={gb_session:.3f} total={gb_total:.2f} "
-                    f"left={gb_remaining:.1f}][/]")
+                log("[dim cyan]prx[a=" + str(ps["alive"]) + " c=" + str(ps["cooldown"]) + "] "
+                    "hits=" + str(hits) + " completed=" + str(done) + " rps=" + ("%.1f" % rps) + " | "
+                    "GB[session=" + ("%.3f" % gb_session) + " total=" + ("%.2f" % gb_total) + " "
+                    "left=" + ("%.1f" % gb_remaining) + "][/]")
 
-                # Bandwidth safety
                 if gb_remaining < STOP_AT_REMAINING_GB:
-                    log(f"[red]⚠ Bandwidth limit reached "
-                        f"({gb_total:.2f}/{BANDWIDTH_LIMIT_GB} GB). "
-                        f"Stopping.[/]")
+                    log("[red]WARN Bandwidth limit reached (" + ("%.2f" % gb_total) + "/" + str(BANDWIDTH_LIMIT_GB) + " GB). Stopping.[/]")
                     STATE.stop.set()
                 elif gb_remaining < BANDWIDTH_WARN_GB:
-                    log(f"[yellow]⚠ Low bandwidth: "
-                        f"{gb_remaining:.1f} GB remaining[/]")
+                    log("[yellow]WARN Low bandwidth: " + ("%.1f" % gb_remaining) + " GB remaining[/]")
         except asyncio.CancelledError:
             return
 
     async def run(self, usernames):
-        # Truncate hits file
         try:
             open(HITS_FILE, "w").close()
         except Exception:
             pass
 
-        # Load proxies
         proxies = load_proxies_from_file(PROXY_FILE)
         if not proxies:
             log("[red]No proxies loaded. Create proxies.txt first.[/]")
@@ -1005,19 +972,16 @@ class Suite:
             tbl.add_column("Value", justify="right")
             tbl.add_row("Total", str(self.pp.size()))
             tbl.add_row("Workers", str(CHECK_WORKERS))
-            tbl.add_row("Rate limit per IP",
-                        f"{PROXY_MAX_PER_MIN}/min")
-            tbl.add_row("Bandwidth used (before)",
-                        f"{self.starting_gb:.2f} GB")
-            tbl.add_row("Bandwidth remaining",
-                        f"{BANDWIDTH_LIMIT_GB - self.starting_gb:.1f} GB")
+            tbl.add_row("Rate limit per IP", str(PROXY_MAX_PER_MIN) + "/min")
+            tbl.add_row("Bandwidth used (before)", "%.2f GB" % self.starting_gb)
+            tbl.add_row("Bandwidth remaining", "%.1f GB" % (BANDWIDTH_LIMIT_GB - self.starting_gb))
             console.print(tbl)
 
         self.checker = Checker(self.pp, self.sm, self.session_id)
         self.stats_task = asyncio.create_task(self._stats_loop())
 
-        log(f"[bold]Checking {len(usernames)} usernames, "
-            f"concurrency={CHECK_WORKERS}[/]\n")
+        log("[bold]Checking " + str(len(usernames)) + " usernames, concurrency=" + str(CHECK_WORKERS) + "[/]")
+        log("")
 
         try:
             await self.checker.run_batch(usernames, CHECK_WORKERS)
@@ -1039,23 +1003,24 @@ class Suite:
         gb_total = self.starting_gb + gb_session
         save_bandwidth_used(gb_total)
 
-        log(f"\n[bold green]═══ FINAL (session {self.session_id}) ═══[/]")
-        log(f"  Elapsed:        {elapsed:.1f}s")
-        log(f"  Available:      [green]{len(hits)}[/]")
-        log(f"  Taken:          {c.get('taken', 0)}")
-        log(f"  Invalid format: {c.get('invalid_format', 0)}")
-        log(f"  Rate limited:   {c.get('rate_limited', 0)}")
-        log(f"  Forbidden:      {c.get('forbidden', 0)}")
-        log(f"  Server errors:  {c.get('server_error', 0)}")
-        log(f"  Client errors:  {c.get('client_error', 0)}")
-        log(f"  Other errors:   {c.get('error', 0)}")
-        log(f"  No proxy:       {c.get('no_proxy', 0)}")
-        log(f"  Skipped:        {c.get('skipped', 0)}")
-        log(f"  ---------------")
-        log(f"  GB this run:    {gb_session:.4f} GB")
-        log(f"  GB total:       {gb_total:.3f} / {BANDWIDTH_LIMIT_GB:.1f} GB")
-        log(f"  GB remaining:   {BANDWIDTH_LIMIT_GB - gb_total:.2f} GB")
-        log(f"  Hits file:      {HITS_FILE} ({len(hits)} lines)")
+        log("")
+        log("[bold green]FINAL (session " + self.session_id + ")[/]")
+        log("  Elapsed:        " + ("%.1f" % elapsed) + "s")
+        log("  Available:      " + str(len(hits)))
+        log("  Taken:          " + str(c.get("taken", 0)))
+        log("  Invalid format: " + str(c.get("invalid_format", 0)))
+        log("  Rate limited:   " + str(c.get("rate_limited", 0)))
+        log("  Forbidden:      " + str(c.get("forbidden", 0)))
+        log("  Server errors:  " + str(c.get("server_error", 0)))
+        log("  Client errors:  " + str(c.get("client_error", 0)))
+        log("  Other errors:   " + str(c.get("error", 0)))
+        log("  No proxy:       " + str(c.get("no_proxy", 0)))
+        log("  Skipped:        " + str(c.get("skipped", 0)))
+        log("  ---------------")
+        log("  GB this run:    " + ("%.4f" % gb_session) + " GB")
+        log("  GB total:       " + ("%.3f" % gb_total) + " / " + ("%.1f" % BANDWIDTH_LIMIT_GB) + " GB")
+        log("  GB remaining:   " + ("%.2f" % (BANDWIDTH_LIMIT_GB - gb_total)) + " GB")
+        log("  Hits file:      " + HITS_FILE + " (" + str(len(hits)) + " lines)")
 
         try:
             with open(SESSION_FILE, "w", encoding="utf-8") as f:
@@ -1075,7 +1040,6 @@ class Suite:
         await self.sm.close()
 
 
-# ==================== MAIN ====================
 _SIGINT_COUNT = [0]
 
 
@@ -1083,10 +1047,11 @@ def _install_sigint(loop):
     def on_sigint():
         _SIGINT_COUNT[0] += 1
         if _SIGINT_COUNT[0] >= 2:
-            log("\n[red]Force exit[/]")
+            log("")
+            log("[red]Force exit[/]")
             os._exit(130)
-        log("\n[yellow]Ctrl+C — stopping gracefully "
-            "(press again to force)[/]")
+        log("")
+        log("[yellow]Ctrl+C - stopping gracefully (press again to force)[/]")
         STATE.stop.set()
 
     try:
@@ -1100,12 +1065,10 @@ def _prompt_mode():
     if RICH:
         console.print(Panel.fit(
             "[bold cyan]Discord Username Checker V11[/]\n"
-            "[dim]Residential Proxies · 100GB · Tokenless[/]",
+            "[dim]Residential Proxies . Tokenless[/]",
             border_style="cyan"))
-        console.print("\n[bold]Mode:[/] "
-                      "[yellow]4l[/] [yellow]4c[/] [yellow]4n[/]  "
-                      "[yellow]3l[/] [yellow]3c[/] [yellow]3n[/]  "
-                      "[yellow]2l[/] [yellow]2c[/] [yellow]2n[/]")
+        console.print("")
+        console.print("[bold]Mode:[/] 4l 4c 4n  3l 3c 3n  2l 2c 2n")
         return Prompt.ask("Mode", default="4c").strip().lower()
     return (input("Mode [4c]: ").strip() or "4c").lower()
 
@@ -1113,7 +1076,7 @@ def _prompt_mode():
 def _prompt_int(p, default):
     if RICH:
         return IntPrompt.ask(p, default=default)
-    v = input(f"{p} [{default}]: ").strip()
+    v = input(p + " [" + str(default) + "]: ").strip()
     try:
         return int(v) if v else default
     except ValueError:
@@ -1134,20 +1097,22 @@ async def amain():
         log("[red]limit must be > 0[/]")
         return
 
-    log(f"[bold]Generating {limit} usernames ({mode})...[/]")
+    log("[bold]Generating " + str(limit) + " usernames (" + mode + ")...[/]")
     try:
         usernames = generate_usernames(mode, limit)
     except ValueError as e:
-        log(f"[red]{e}[/]")
+        log("[red]" + str(e) + "[/]")
         return
-    log(f"[green]✓[/] {len(usernames)} usernames\n")
+    log("[green]OK[/] " + str(len(usernames)) + " usernames")
+    log("")
 
     suite = Suite()
     try:
         await suite.run(usernames)
     except KeyboardInterrupt:
         STATE.stop.set()
-        log("\n[yellow]Interrupted[/]")
+        log("")
+        log("[yellow]Interrupted[/]")
         if suite.checker:
             suite.checker.close()
         try:
@@ -1160,12 +1125,14 @@ def main():
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
-        print("\nForced exit")
+        print("")
+        print("Forced exit")
     except Exception as e:
-        print(f"Fatal: {e}")
+        print("Fatal: " + str(e))
         import traceback
         traceback.print_exc()
 
 
 if __name__ == "__main__":
     main()
+PYEOF
