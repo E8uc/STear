@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-"""
-Discord Username Checker V11 - Residential Proxies Edition
-"""
 import os
 import sys
 import time
