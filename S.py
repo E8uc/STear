@@ -1,4 +1,3 @@
-cat > /root/GTead/S.py << 'PYEOF'
 #!/usr/bin/env python3
 """
 Discord Username Checker V11 - Residential Proxies Edition
